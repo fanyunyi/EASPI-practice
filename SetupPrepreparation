@@ -1,0 +1,283 @@
+using System;
+using System.Linq;
+using System.Text;
+using System.Windows;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using VMS.TPS.Common.Model.API;
+using VMS.TPS.Common.Model.Types;
+using System.Net.NetworkInformation;
+using System.Text.RegularExpressions;
+using System.Windows.Documents;
+using System.Windows.Media;
+using System.Windows.Media.Media3D;
+using System.Windows.Automation.Peers;
+using System.ComponentModel;
+
+// TODO: Replace the following version attributes by creating AssemblyInfo.cs. You can do this in the properties of the Visual Studio project.
+[assembly: AssemblyVersion("1.0.1.2")]
+[assembly: AssemblyFileVersion("1.0.1.2")]
+[assembly: AssemblyInformationalVersion("1.0")]
+[assembly: AssemblyCopyright("by FanYunyi")]
+// TODO: Uncomment the following line if the script requires write access.
+[assembly: ESAPIScript(IsWriteable = true)]
+
+namespace VMS.TPS
+{
+    public class Script
+    {
+        public Script()
+        {
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public void Execute(ScriptContext context /*, System.Windows.Window window, ScriptEnvironment environment*/)
+        {
+            // TODO : Add here the code that is called when the script is launched from Eclipse.
+            Patient patient = context.Patient;
+            patient.BeginModifications();
+            StringBuilder sb = new StringBuilder();
+            Course course = context.Course;
+            PlanSetup plan = context.PlanSetup; 
+            if (plan == null)
+            {
+                MessageBox.Show("Please load a plan first.");
+                return;
+            }
+            String energy = plan.Beams.First().EnergyModeDisplayName.ToString();
+            StructureSet ss = context.StructureSet;
+            Structure body = ss.Structures.First(s => s.Id =="Body");       
+            Dose dose = plan.Dose;
+            // construct the largest target volume, aka the sum of all PTV.        
+            try
+            {
+                if (energy == "6X")
+                {
+                    // add plan normalization check
+                    
+                    ExternalPlanSetup eplan = context.ExternalPlanSetup;
+                    
+                    if(eplan.PlanNormalizationMethod == "No plan normalization")
+                    {
+                        MessageBox.Show("No normalization method has been selected!");
+                        return;
+                    }
+                    if (1.00 == eplan.TreatmentPercentage)
+                    {
+                        MessageBox.Show("Unproper treatment percentage.");
+                        return;
+                    }
+                    Structure target = ss.AddStructure("Control", "all");
+                    // reasonable candidate structures to be fit should be the
+                    // target volume involved in the current optimization
+                    var opt = eplan.OptimizationSetup.Objectives;
+                    List<OptimizationObjective> optLower = opt.Where(o => o.Operator == OptimizationObjectiveOperator.Lower).ToList();
+                    List<Structure> targets = new List<Structure>(); 
+                    if (optLower.Any())
+                    {
+                        targets = optLower.Select(o => o.Structure).Distinct().ToList();
+                    }
+                    else
+                    {
+                        targets = ss.Structures.Where(s => s.DicomType == "PTV").ToList();
+                        if (0.90 != eplan.TreatmentPercentage)
+                        {
+                            MessageBox.Show("CRT plan in SDCH requires a treatment percentage of 90%.");
+                            ss.RemoveStructure(target);
+                            return;
+                        }
+                    }
+                    foreach (Structure t in targets) { target.SegmentVolume = target.Or(t); }                    
+                    string machine = plan.Beams.First().TreatmentUnit.ToString();
+                    ExternalBeamMachineParameters paras = new ExternalBeamMachineParameters(machine, "6X", 600, "STATIC", null);
+                    VVector iso_beam = eplan.Beams.First().IsocenterPosition;
+                    string technique = eplan.Beams.First().Technique.ToString();
+                    float[,] leafPositions = new float[2, 60];
+                    var jawRect = new VRect<double>(-50, -50, 50, 50);
+                    FitToStructureMargins margins = new FitToStructureMargins(0);
+                    // if setup fields exist, refit target volumes;
+                    if (eplan.Beams.Any(b => b.WeightFactor == 0)){
+                        Beam Field0 = eplan.Beams.First(b => b.Id == "Field 0" || b.Id == "Field0");
+                        Field0.Id = "Field 0";
+                        Field0.FitMLCToStructure(target);
+                        Field0.FitCollimatorToStructure(margins, target, true, true, false);
+                        Beam FieldCBCT = eplan.Beams.First(b => Regex.IsMatch(b.Id, @"cbct", RegexOptions.IgnoreCase));
+                        FieldCBCT.FitCollimatorToStructure(margins, target, true, true, false);
+                        FieldCBCT.Id = "Field CBCT";
+                    }
+                    // if setup field do not exist, creat new fields, fit target volumes;
+                    else
+                    {
+                        Beam Field0 = eplan.AddMLCSetupBeam(paras, leafPositions, jawRect, 0, 0, 0, iso_beam);
+                        Field0.Id = "Field 0";
+                        Field0.FitMLCToStructure(target);
+                        Field0.FitCollimatorToStructure(margins, target, true, true, false);
+                        try
+                        {
+                            Beam FieldCBCT = eplan.AddSetupBeam(paras, jawRect, 0, 0, 0, iso_beam);
+                            FieldCBCT.FitCollimatorToStructure(margins, target, true, true, false);
+                            FieldCBCT.Id = "Field CBCT";
+                        }
+                        catch 
+                        {
+                            MessageBox.Show("This is an old linac, CBCT can not be added");
+                        }
+                    }
+                    if (ss.Structures.Any(s => Regex.IsMatch(s.Id, @"Bolus", RegexOptions.IgnoreCase)) && !eplan.Beams.Any(b => Regex.IsMatch(b.Id, "Field Bolus")))
+                    {
+                        Structure bolus = ss.Structures.First(s => Regex.IsMatch(s.Id, @"Bolus", RegexOptions.IgnoreCase));
+                        Beam Fieldbolus = eplan.AddMLCSetupBeam(paras, leafPositions, jawRect, 0, 0, 0, iso_beam);
+                        Fieldbolus.Id = "Field Bolus";
+                        Fieldbolus.FitMLCToStructure(bolus);
+                        Fieldbolus.FitCollimatorToStructure(margins, bolus, true, true, false);
+                    }
+                    // Add tangent setup field for breast plan
+                        Beam beamT = eplan.Beams.Where(b => b.IsSetupField && b.ControlPoints.First().GantryAngle != 0).FirstOrDefault();
+                        if (beamT != null) { eplan.RemoveBeam(beamT); }
+                        
+                    if (course.Id.IndexOf("bre", StringComparison.OrdinalIgnoreCase) >= 0 && (technique == "STATIC"))
+                    {
+                        Structure heart = ss.Structures.First(s => s.Id == "Heart");
+                        if (eplan.Beams.First().IsocenterPosition.x > heart.CenterPoint.x)
+                        {
+                            Beam selectBeam = eplan.Beams.Where(b => b.ControlPoints.First().GantryAngle > 181).
+                               OrderBy(b => b.ControlPoints.First().GantryAngle).First();                           
+                            double gantryAngle = selectBeam.ControlPoints.First().GantryAngle;
+                            double collimatorAngle = selectBeam.ControlPoints.First().CollimatorAngle;
+                            Beam FieldT = eplan.AddMLCSetupBeam(paras, leafPositions, jawRect, collimatorAngle, gantryAngle, 0, iso_beam);
+                            FitToStructureMargins margins1 = new FitToStructureMargins(0,0,25,0);
+                            FieldT.FitMLCToStructure(margins1,target, false, JawFitting.FitToStructure,
+                                OpenLeavesMeetingPoint.OpenLeavesMeetingPoint_Middle,ClosedLeavesMeetingPoint.ClosedLeavesMeetingPoint_BankTwo);
+                            FieldT.FitCollimatorToStructure(margins1, target, true, true, false);
+                            FieldT.Id = "Field T";
+                        }
+                        else
+                        {
+                            Beam selectBeam = eplan.Beams.Where(b => b.ControlPoints.First().GantryAngle < 180).
+                                OrderBy(b => b.ControlPoints.First().GantryAngle).Last();
+                            //if (selectBeam.ControlPoints.First().GantryAngle == selectBeam.ControlPoints.Last().GantryAngle)
+                            double gantryAngle = selectBeam.ControlPoints.First().GantryAngle;
+                            double collimatorAngle = selectBeam.ControlPoints.First().CollimatorAngle;
+                            Beam FieldT = eplan.AddMLCSetupBeam(paras, leafPositions, jawRect, collimatorAngle, gantryAngle, 0, iso_beam);
+                            FitToStructureMargins margins1 = new FitToStructureMargins(25, 0, 0, 0);
+                            FieldT.FitMLCToStructure(margins1, target, false, JawFitting.FitToStructure,
+                                OpenLeavesMeetingPoint.OpenLeavesMeetingPoint_Middle, ClosedLeavesMeetingPoint.ClosedLeavesMeetingPoint_BankOne);
+                            FieldT.FitCollimatorToStructure(margins1, target, true, true, false);
+                            FieldT.Id = "Field T";
+                        }
+                    }
+                    ss.RemoveStructure(target);
+                    // measure reference SSD.
+                    VVector userOrigin = context.Image.UserOrigin;
+                    Beam originBeam = eplan.AddMLCSetupBeam(paras, leafPositions, jawRect, 0, 0, 0, userOrigin);
+                    double refSSDinMM1 = originBeam.SSD;
+                    eplan.RemoveBeam(originBeam);
+                    if (ss.Structures.Any(s => Regex.IsMatch(s.Id, @"ZZ_refSSD: ")))
+                    {
+                        Structure refSSD = ss.Structures.First(s => Regex.IsMatch(s.Id, @"ZZ_refSSD: "));
+                        ss.RemoveStructure(refSSD);
+                    };
+                    ss.AddStructure("Organ", "ZZ_refSSD: " + (refSSDinMM1 / 10).ToString("F1") + " cm");
+                }
+                if (energy == "6X-FFF")
+                {
+                    ExternalPlanSetup eplan = context.ExternalPlanSetup;
+                    if (eplan.PlanNormalizationMethod == "No plan normalization")
+                    {
+                        MessageBox.Show("No normalization method has been selected!");
+                        return;
+                    }
+                    if (1.00 == eplan.TreatmentPercentage)
+                    {
+                        MessageBox.Show("Unproper treatment percentage.");
+                        return;
+                    }
+                    var opt = eplan.OptimizationSetup.Objectives;
+                    List<OptimizationObjective> optLower = opt.Where(o => o.Operator == OptimizationObjectiveOperator.Lower).ToList();
+                    if (optLower.Any())
+                    {
+                        if (course.ExternalPlanSetups.Count() == 1)
+                        {
+                            MessageBox.Show("Check the EPID algorithm for a new plan.");
+                        }
+                    }
+                    else
+                    {
+                        if (0.90 != eplan.TreatmentPercentage)
+                        {
+                            MessageBox.Show("A CRT plan in our institution require a treatment percentage of 90%.");
+                            return;
+                        }
+                    }              
+                }
+                if (energy == "70-250P")
+                {
+                    IonPlanSetup iplan = context.IonPlanSetup;
+                    if (iplan.PlanNormalizationMethod == "No plan normalization")
+                    {
+                        MessageBox.Show("No normalization method has been selected!");
+                        return;
+                    }
+                    if (!ss.CanAddStructure("Control", "A_Dose20%"))
+                    {
+                        Structure oldDoseRegion = ss.Structures.First(s => s.Id == "A_Dose20%");
+                        ss.RemoveStructure(oldDoseRegion);
+                    }
+                    Structure dose20 = ss.AddStructure("Control", "A_Dose20%");
+                    dose20.ConvertDoseLevelToStructure(dose, new DoseValue(20, "%"));
+                    foreach (IonBeam IonBeam in iplan.IonBeams)
+                    {
+                        IonBeam.Id = Regex.Split(IonBeam.Id, @"[-_]{1}").First();
+                        //MessageBox.Show(IonBeam.Id);
+                        IonBeam.Id = IonBeam.Id + "_" + IonBeam.ControlPoints.First().GantryAngle.ToString() +
+                                     (
+                                        (IonBeam.ControlPoints.First().PatientSupportAngle == 0)
+                                        ? "" : "_" + IonBeam.ControlPoints.First().PatientSupportAngle.ToString()
+                                     );
+                    }
+                    if (course.IonPlanSetups.Count() == 1)
+                    {
+                        MessageBox.Show("Remember to export RTplan to AccuCheck.");
+                        //Course courseQA = context.Patient.AddCourse();
+                        //courseQA.Id = "QA_" + course.Id;
+                        //string machine = iplan.IonBeams.First().TreatmentUnit.ToString();
+                        //string technique = iplan.IonBeams.First().Technique.ToString();
+                        //string tolerance = iplan.IonBeams.First().ToleranceTableLabel.ToString();
+                        //var editableParameters = iplan.IonBeams.First().GetEditableParameters();
+                        ////ProtonBeamMachineParameters paras = new ProtonBeamMachineParameters(machine, technique, tolerance);
+                        //ProtonBeamMachineParameters paras = new ProtonBeamMachineParameters("ProBeam", "MODULAT_SCANNING", "T1");
+                        ////iplan.IonBeams.First().s
+                        ////foreach (IonBeam b in iplan.IonBeams)
+                        ////{
+                        //IonBeam b = iplan.IonBeams.First();
+                        //    IonPlanSetup iQA = courseQA.AddIonPlanSetupAsVerificationPlan(ss, iplan.PatientSupportDevice.Id, iplan);
+                        //    //IonPlanSetup iQA = courseQA.AddIonPlanSetup(ss,iplan.PatientSupportDevice.Id);
+                        //    iQA.Id = b.Id;
+                        //var editableParameters1 = b.GetEditableParameters();
+                        //patient.BeginModifications();
+                        //Beam fieldQA = iQA.AddModulatedScanningBeam(paras, "S1", 42, 0, 0, new VVector{ x = 0, y = 0, z = 0});
+                        
+                        //    //fieldQA.ApplyParameters(editableParameters1.ControlPoints);
+                        ////BeamParameters beamParameters = new BeamParameters()
+                        //    fieldQA.Id = b.Id;
+                        ////}
+                    }
+                }
+            }
+            finally
+            {
+                // for a patient with 2 or more sites to treat, the mark should include treatment site information
+                // plan can be named like "Chest0911" or "Che0911", and course can be named like "C_che" or "C_chest".           
+                string siteMark1 = Regex.Match(Regex.Split(context.PlanSetup.Id, @"\d+").First(), @".{3}").ToString();
+                string siteMark = Regex.Match(Regex.Split(context.Course.Id, @"[-_]").Last(), @".{3}").ToString();
+                string siteMark2 = !string.IsNullOrEmpty(siteMark) ? siteMark : 
+                    (!string.IsNullOrEmpty(siteMark1) && (siteMark1 != "Pla")) ? siteMark1 : "";
+                // copy ptid and plan time into clipboard
+                string patientMark = patient.Id + "_" + DateTime.Today.ToString("yyyyMMdd") + 
+                    (!string.IsNullOrEmpty(siteMark2) ? "_" + siteMark2 + "_": "_") ;
+                Clipboard.SetText(patientMark);
+            }
+        }
+    }
+}
