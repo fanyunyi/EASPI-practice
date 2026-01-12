@@ -1,0 +1,182 @@
+using System;
+using System.Linq;
+using System.Text;
+using System.Windows;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using VMS.TPS.Common.Model.API;
+using VMS.TPS.Common.Model.Types;
+using System.IO;
+using System.Windows.Data;
+using System.Security.Cryptography;
+using System.Windows.Controls;
+//using LiveCharts;
+//using LiveCharts.WinForms;
+//using System.Windows.Forms;
+//using System.Drawing;
+
+// TODO: Replace the following version attributes by creating AssemblyInfo.cs. You can do this in the properties of the Visual Studio project.
+[assembly: AssemblyVersion("1.0.0.1")]
+[assembly: AssemblyFileVersion("1.0.0.1")]
+[assembly: AssemblyInformationalVersion("1.0")]
+
+// TODO: Uncomment the following line if the script requires write access.
+[assembly: ESAPIScript(IsWriteable = true)]
+
+namespace VMS.TPS
+{
+    public class Script
+    {
+        public Script()
+        {
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public void Execute(ScriptContext context, System.Windows.Window windowDisplay /*, System.Windows.Window window, ScriptEnvironment environment*/)
+        {
+            // TODO : Add here the code that is called when the script is launched from Eclipse.
+            Patient patient = context.Patient;
+            patient.BeginModifications();
+            PlanSetup oriPlan = context.Course.PlanSetups.First();
+            StructureSet ss = context.StructureSet;
+            Structure ctv = ss.Structures.First(s => s.Id == "CTV");
+            Structure body = ss.Structures.First(s => s.Id == "Body");
+            // evaluation baseline for Chest plan, this part changes with different treatment site.
+            // other loop?
+            Structure lung_R = ss.Structures.First(s => s.Id == "Lung_R");
+            Structure lung_L = ss.Structures.First(s => s.Id == "Lung_L");
+            Structure heart = ss.Structures.First(s => s.Id == "Heart");
+            Structure spinalcord = ss.Structures.First(s => s.Id == "SpinalCord");
+            IonPlanSetup oriPlanp = context.Course.IonPlanSetups.First();
+            var normalizationPoint = oriPlanp.PlanNormalizationValue;
+            var option1 = new OptimizationOptionsIMPT(100, OptimizationOption.RestartOptimization);
+            var option2 = new OptimizationOptionsIMPT(20, OptimizationOption.ContinueOptimizationWithPlanDoseAsIntermediateDose);
+            List<string> MMU = new List<string>
+            {
+                "2", "5", "8"
+            };
+            List<string> layerSpacing = new List<string>
+            {
+                "2", "3", "4"
+            };
+            List<string> spotSpacing = new List<string>
+            {
+               "0.5", "0.75", "1.0"
+            };
+
+
+            StreamWriter sw = new StreamWriter("D:\\fanyunyi\\Obj_Paras20251005.csv", true);
+            sw.WriteLine("PlanId", "objValue", "beamDeliveryTime", "HI", "CI");
+            for (var i = 0; i < 3; i++)
+            {
+                for (var j = 0; j < 3; j++)
+                {
+                    for (var k = 0; k < 3; k++)
+                    {
+                        PlanSetup MU = context.Course.CopyPlanSetup(oriPlan);
+                        MU.Id = "M" + MMU[i] + "L" + layerSpacing[j] + "S" + spotSpacing[k];
+
+
+                        MU.SetCalculationModel(CalculationType.ProtonVolumeDose, "PCS-M" + MMU[i] + "L" + layerSpacing[j]);
+                        MU.SetCalculationModel(CalculationType.ProtonOptimization, "NUPO-M" + MMU[i] + "L" + layerSpacing[j]);
+                        MU.SetCalculationModel(CalculationType.ProtonBeamLineModifiers, "PCS-M" + MMU[i] + "L" + layerSpacing[j]);
+                        MU.SetCalculationModel(CalculationType.ProtonDDC, "PCS-M" + MMU[i] + "L" + layerSpacing[j]);
+                        MU.SetCalculationModel(CalculationType.ProtonMSPostProcessing, "PCS-M" + MMU[i] + "L" + layerSpacing[j]);
+                        // NPC.SetCalculationOption("PO_1610", "/PhotonOptimizerCalculationOptions/VMAT/@ConvergenceMode", "Off");
+                        MU.SetCalculationOption("PCS-M" + MMU[i] + "L" + layerSpacing[j], "ProtonCalculationOptions/ModulatedScanning/" +
+                                        "Beamline/OverwriteSpotSpacingInScanningDirection", "True");
+                        MU.SetCalculationOption("PCS-M" + MMU[i] + "L" + layerSpacing[j], "ProtonCalculationOptions/ModulatedScanning/" +
+                            "Beamline/SpotSpacingInScanningDirectionInCM", spotSpacing[k]);
+                        MU.SetCalculationOption("PCS-M" + MMU[i] + "L" + layerSpacing[j], "ProtonCalculationOptions/ModulatedScanning/" +
+                            "Beamline/OverwriteSpacingBetweenScanningLines", "True");
+                        MU.SetCalculationOption("PCS-M" + MMU[i] + "L" + layerSpacing[j], "ProtonCalculationOptions/ModulatedScanning/" +
+                            "Beamline/SpacingBetweenScanningLinesInCM", spotSpacing[k]);
+                        MU.SetCalculationOption("NUPO-M" + MMU[i] + "L" + layerSpacing[j], "ProtonCalculationOptions/SpotOptimization/" +
+                            "SpotSpacingUnit", "FixedSpacingInCM");
+                        MU.SetCalculationOption("NUPO-M" + MMU[i] + "L" + layerSpacing[j], "ProtonCalculationOptions/SpotOptimization/" +
+                            "SpotSpacing", spotSpacing[k]);
+
+                        //foreach (var type in Enum.GetValues(typeof(CalculationType)))
+                        //Enum.GetUnderlyingType(typeof(CalculationType));
+
+                        IonPlanSetup MUp = (IonPlanSetup)MU;
+                        MUp.CalculateBeamLine();
+                        //MUp.OptimizeIMPT(option1);
+                        double objValue = MUp.OptimizeIMPT(option1).TotalObjectiveFunctionValue;
+                        MUp.PlanNormalizationValue = normalizationPoint;
+                        MUp.PostProcessAndCalculateDose();
+                        //HI CI
+                        double D2 = MUp.GetDoseAtVolume(ctv, 0.02, VolumePresentation.Relative, DoseValuePresentation.Absolute).Dose;
+                        double D98 = MUp.GetDoseAtVolume(ctv, 0.98, VolumePresentation.Relative, DoseValuePresentation.Absolute).Dose;
+                        double D50 = MUp.GetDoseAtVolume(ctv, 0.5, VolumePresentation.Relative, DoseValuePresentation.Absolute).Dose;
+                        double HI = (D2 - D98) / D50 * 100;
+                        double V95 = MUp.GetVolumeAtDose(body, new DoseValue(95, "%"), VolumePresentation.AbsoluteCm3);
+                        double CI = V95 / ctv.Volume;
+                        double lungL_V20 = MUp.GetVolumeAtDose(lung_L, new DoseValue(20, "Gy"), VolumePresentation.Relative);
+                        double lungL_V5 = MUp.GetVolumeAtDose(lung_L, new DoseValue(5, "Gy"), VolumePresentation.Relative);
+                        double lungR_V20 = MUp.GetVolumeAtDose(lung_L, new DoseValue(20, "Gy"), VolumePresentation.Relative);
+                        double lungR_V5 = MUp.GetVolumeAtDose(lung_L, new DoseValue(5, "Gy"), VolumePresentation.Relative);
+                        //BDT
+                        double spotDeliveryTime = new double();
+                        double layerSwitchTime = new double();
+                        double beamDeliveryTime = new double();
+                        int currentMmuLimit = Convert.ToInt32(MMU[i]);
+                        int baseDosePara = 400;
+                        List<double[,]> dataPareto = new List<double[,]>();
+                        foreach (IonBeam beam in MUp.Beams)
+                        {
+                            var indexBeam = beam.Id;
+                            IonBeamParameters beamParameters = beam.GetEditableParameters();
+                            IonControlPointPairCollection cpPara = beamParameters.IonControlPointPairs;
+                            foreach (var cp in cpPara)
+                            {
+                                var ennergy = cp.NominalBeamEnergy;
+                                double currentLayerMuThereshold = 2 + (1.15 * ennergy - 70) / 10;
+                                layerSwitchTime = 0.9 * cpPara.Count();
+                                //IonSpotParametersCollection iCp = cp.RawSpotList;
+                                IonSpotParametersCollection iCp = cp.FinalSpotList;
+                                double currentLayerDoseRate = new double();
+                                if (currentMmuLimit > currentLayerMuThereshold)
+                                {
+                                    //saturated dose rate
+                                    currentLayerDoseRate = baseDosePara * currentLayerMuThereshold;
+                                }
+                                else
+                                {
+                                    currentLayerDoseRate = baseDosePara * currentMmuLimit;
+                                }
+                                int iCount = iCp.Count;
+                                double totalWeight = new double();
+                                for (int ii = 0; ii < iCount; ii++)
+                                { //for 60 pair leafs                           
+                                    double xPos = iCp[ii].X;
+                                    double yPos = iCp[ii].Y;
+                                    double weight = iCp[ii].Weight;
+                                    totalWeight += weight;
+                                }
+                                spotDeliveryTime = spotDeliveryTime + totalWeight / currentLayerDoseRate;
+                                //cp.LeafPositions = cpLeafPos;
+                            }
+                            beamDeliveryTime = beamDeliveryTime + spotDeliveryTime + layerSwitchTime;                         
+                        }
+                        // turn it into a new data type.
+                        sw.WriteLine("{0},{1},{2:F2}, {3:F2}, {4:F2}", MU.Id, objValue, beamDeliveryTime, HI, CI);
+                        
+                        //var series1 = new System.Windows.Forms.DataVisualization.Charting.Series
+                        //{
+                        //    Name = "Pareto Front",
+                        //    ChartType = System.Windows.Forms.DataVisualization.Charting.SeriesChartType.Line, // 
+                        //    BorderWidth = 3,
+                        //    IsVisibleInLegend = true
+                        //};
+                        // give a evaluation standard.
+                        //LiveCharts.WinForms.CartesianChart
+                    }
+                }
+            }
+            sw.Close();
+        }
+    }
+}
+    
